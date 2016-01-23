@@ -16,15 +16,19 @@ You need to have [Makiki](https://github.com/shirok/Gauche-makiki) installed to 
 
 ## Usage
 
-### `scmxref-html [-d dest-dir] file.scm [file2.scm ...]`
-
+```
+scmxref-html [-d dest-dir] file.scm [file2.scm ...]
+```
 Create html files from file.scm ... into dest-dir.
 For example, [this](http://shkmr.github.io/gauche/scmxref/) is the result of
 ```
    $ scmxref-html scmxref scmxref/*.scm
 ```
 
-### `scmxref-makiki [-p port ] [file2.scm ...]`
+```
+scmxref-makiki [-p port ] [file2.scm ...]
+```
+
 
 Web server version. Index is dynamically created.
 
