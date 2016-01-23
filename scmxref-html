@@ -1,0 +1,90 @@
+#!/usr/bin/env gosh
+; -*- Scheme -*-
+;;;
+;;;   scmxref -- generate cross reference for Gauche code in html format
+;;;
+(use gauche.parameter)
+(use gauche.parseopt)
+(use file.util)
+(use text.html-lite)
+(use text.tree)
+(use scmxref)
+(use scmxref.path-util)
+
+;;;
+;;;  Customize
+;;;
+;;(gauche-man-base "http://practical-scheme.net/wiliki/schemexref.cgi?")
+;;(gauche-man-base "http://practical-scheme.net/gauche/man/?l=en&p="   )
+;;(gauche-man-base "http://practical-scheme.net/gauche/man/?l=jp&p="   )
+;;(documented-modules '()) ; see dictionary.scm
+(anchor-all-lines #t)
+
+;;;
+;;;
+;;;
+(define force-output (make-parameter #f))
+(define verbose      (make-parameter #t))
+(define (message . x)   (if (verbose) (apply print x)))
+
+(define (file->list-of-anchored-strings file)
+  (let* ((L (string-split (file->anchored-string file) #\newline))
+         (N (length L)))
+    (map (lambda (n l)
+           (list (format "~4,'0d: " n) l "\n"))
+         (iota N 1) L)))
+
+(define (generate-html-files files dest-dir)
+
+  (if (and (not (force-output)) (file-exists? dest-dir))
+    (error #"~|dest-dir| already exists"))
+
+  (for-each (lambda (file)
+              (let ((outfile #"~|dest-dir|/~(string-append file \".html\")")
+                    (prefix (path-to-top file)))
+                (make-directory* (sys-dirname outfile))
+                (message #"~|file| -> ~|outfile|")
+                (with-output-to-file outfile
+                  (lambda ()
+                    (write-tree
+                     (html:html
+                      (html:head
+                       (html:title file)
+                       (html:style stylesheet))
+                      (html:body
+                       (html:a :href #"~|prefix|index.html" "index")
+                       (html:pre
+                        (file->list-of-anchored-strings file))
+                       (html:a :href #"~|prefix|index.html" "Index"))))))))
+            files))
+
+(define (generate-files files dest-dir)
+  (generate-html-files files dest-dir)
+  (with-output-to-file #"~|dest-dir|/index.html" display-index.html))
+
+;;;
+;;;  Main
+;;;
+(define (usage progname)
+  (print "\
+usage: " progname " [options] [file ...]
+options:
+        -h          Print this message
+        -q          Quiet mode
+        -d dest     Specify directory where html files are created. Default is html
+        -f          Force output even if dest exists.")
+  (exit 0))
+
+(define (main args)
+  (let-args (cdr args)
+      ((#f         "q|quiet"   => (cut verbose #f))
+       (#f         "f|force"   => (cut force-output #t))
+       (#f         "h|help"    => (cut usage (car args)))
+       (dest-dir   "d|dest=s" "html")
+       . rest)
+    (unless (null? rest)
+      (build-dictionary rest)
+      (generate-files rest dest-dir))
+    0))
+
+;;; EOF

@@ -1,0 +1,563 @@
+#!/usr/bin/env gosh
+;;
+;;  scmxref-makiki -- Gacuhe code browser
+;;
+(use gauche.parseopt)
+(use gauche.parameter)
+(use gauche.threads)
+(use data.cache)
+(use file.util)
+(use text.html-lite)
+(use srfi-1)
+(use srfi-27) ; Sources of random bits
+(use util.match)
+(use makiki)
+(use scmxref)
+(use scmxref.path-util)
+
+;;;
+;;;   Customize
+;;;
+;;(documented-modules '()) ; see dictionary.scm
+(anchor-all-lines  #t)
+(anchor-file-extension "")
+(place-goto-anchor #t)
+
+;;;
+;;;   Session:  from Gauche-makiki/examples/session2.scm
+;;;
+
+(define-class <app> ()
+  (;; session table is just a TTLR cache, keyed by session token in the cookie.
+   ;; session data :
+   ;;  (#f . <path>)     - a non-logged-in client is trying to access <path>
+   ;;  (#t . <username>) - logged in.
+   [sessions :init-form (make-ttlr-cache (* 10 60))]))
+
+(define *passcode* #f)
+
+;;
+;; Returns session-data (#f . path) or (#t . user), if it exists.
+;;
+(define (session-data req app)
+  (and-let1 cookie (request-cookie-ref req "sess")
+    (atomic app (^[a] (cache-lookup! (~ a'sessions) (cadr cookie) #f)))))
+
+;;
+;; Returns username if the client has active session, #f otherwise.
+;;
+(define (check-login req app)
+  (and-let* ([data (session-data req app)]
+             [ (car data) ])
+    (cdr data)))
+
+(define (session-delete! req app)
+  (and-let1 cookie (request-cookie-ref req "sess")
+    (atomic app (^[a] (cache-evict! (~ a'sessions) (cadr cookie))))))
+
+(define (session-create! req app data)
+  (let1 key (format "~8,'0x~16,'0x" (sys-time) (random-integer (expt 2 64)))
+    ($ atomic app (^[a] (cache-write! (~ a'sessions) key data)))
+    (response-cookie-add! req "sess" key :path "/")))
+
+;;
+;; Browsers may try to fetch this.  We catch this specially so that
+;; the later 'catch all' clause won't be confused.
+;;
+(define-http-handler "/favicon.ico" (^[req app] (respond/ng req 404)))
+
+(define-http-handler "/logout"
+  (^[req app]
+    (session-delete! req app)
+    (respond/ok req
+      (html:html
+       (html:head (html:title "Logged out"))
+       (html:body (html:p "You've successfully logged out.")
+                  (html:p (html:a :href "/" "MainMenu")))))))
+
+(define-http-handler "/login"
+  ? session-data
+  (with-post-parameters
+   (^[req app]
+     (match (request-guard-value req)
+       [(and (#f . path) data)
+        (let ((p (request-param-ref req "pass")))
+          (if (equal? *passcode*  p)
+            (begin
+              (set! (car data) #t)
+              (set! (cdr data) "SCMXREF")
+              (respond/redirect req path))
+            (respond/ok req (login-form "Invalid login"))))]
+       [(#t . user)
+        (respond/ok req
+          (html:html
+           (html:head (html:title "Welcome"))
+           (html:body (html:p "You've already logged in.")
+                      (html:p (html:a :href "/" "Top"))
+                      (html:p (html:a :href "/logout" "Log out")))))]))))
+
+(define (login-form msg)
+  (html:html
+   (html:head (html:title "Login"))
+   (html:body (if msg (html:p msg) "")
+              (html:form
+               :action "/login" :method "POST"
+               (html:p "Passcode:" (html:input :type "password" :name "pass")
+                       (html:input :type "submit"
+                                   :name "submit"
+                                   :value "connect"))))))
+
+;;;
+;;;    Web Application
+;;;
+(define-http-handler "/"
+  (lambda (req app)
+    (let ((lang (select-response-lang req)))
+      (respond/ok req
+        (html:html
+         (html:head
+          (html:meta :charset "utf-8")
+          (html:style stylesheet)
+          (html:title "scmxref/makiki"))
+         (html:body
+          (html:h1 (html:a :href "http://shkmr.github.com/scmxref/" "scmxref/makiki"))
+          (html:p "TopDir: " (current-directory))
+          (case lang
+            ((jp)
+             (list (html:h2 "お品書き")
+                   (html:ul
+                    (html:li (html:a :class "menu" :href "/browse/"  "ファイルを見る"))
+                    (html:li (html:a :class "menu" :href "/xref/"    "索引"))
+                    (html:li (html:a :class "menu" :href "/close"    "サーバを止める")))
+                   manual-jp))
+            (else
+             (list (html:h2 "Main Menu")
+                   (html:ul
+                    (html:li (html:a :class "menu" :href "/browse/"  "Browse files"))
+                    (html:li (html:a :class "menu" :href "/xref/"    "Reference index"))
+                    (html:li (html:a :class "menu" :href "/close"    "Close server")))
+                   manual-en)))))))))
+
+;;
+(define-http-handler "/browse"
+  (lambda (req app)
+    (respond/redirect req "/browse/")))
+
+(define-http-handler #/^\/browse(\/.*)$/
+  ? check-login
+  (lambda (req app)
+    (let ((file (string-scan (request-path req) "/browse/" 'after)))
+      (set-gauche-man req)
+      (cond ((string=? file "")         (respond/directory-list req "."))
+            ((file-is-directory?  file) (respond/directory-list req file))
+            ((file-is-gauche? file)     (handle-gauche    req file))
+            ((file-is-regular? file)    (handle-otherfile req file))
+            (else                       (respond/ng req 404))))))
+
+;;
+(define-http-handler "/xref/"
+  ? check-login
+  (let ((back "./"))
+    (lambda (req app)
+      (let ((referer (request-header-ref req "referer" "-")))
+        (if (not (rxmatch #/\/xref\/$/ referer))
+          (set! back referer))
+        (respond/ok req
+          (html:html
+           (html:head (html:title "scmxref: " (current-directory))
+                      (html:style stylesheet))
+           (html:body
+            "(" (html:a :class "menu" :href "../"               "MainMenu") ")"
+            "(" (html:a :class "menu" :href "../browse/"        "TopDir"  ) ")"
+            "(" (html:a :class "menu" :href "../rebuild"        "Rebuild" ) ")"
+            "(" (html:a :class "menu" :href "../reset"          "Reset"   ) ")"
+            "(" (html:a :class "menu" :href back                "Back"    ) ")"
+            (html:h1 "Index")
+            (map (lambda (f)
+                   (list
+                    (html:h2 (html:a :class "file" :href f f)
+                             "&nbsp;(" (html:a :class "remove" :href #"../remove?file=~|f|" "remove") ")")
+                    (with-output-to-string
+                      (lambda () (display-index-table f)))))
+                 (sort (dictionary-file-list))))))))))
+
+;;
+(define-http-handler #/^\/xref\/.*$/
+  (lambda (req app)
+    (let ((file (string-scan (request-path req) "/xref/" 'after)))
+      (respond/redirect req #"/browse/~|file|"))))
+
+;;
+(define-http-handler "/find/"
+  ? check-login
+  (lambda (req app)
+    (let* ((params  (request-params req))
+           (name    (cond ((assoc "name" params)
+                           => (lambda (e) (string->symbol (cadr e)))))))
+      (set-gauche-man req)
+      (cond ((dictionary-get name)
+             => (lambda (entry)
+                  (respond/ok req
+                    (html:html
+                     (html:head
+                      (html:title name))
+                     (html:body
+                      (list "(" (html:a :class "menu" :href "../"               "MainMenu") ")"
+                            "(" (html:a :class "menu" :href "../browse/"        "TopDir"  ) ")"
+                            "(" (html:a :class "menu" :href "../rebuild"        "Rebuild" ) ")"
+                            "(" (html:a :class "menu" :href "../reset"          "Reset"   ) ")"
+                            )
+                      (html:h2 (html:a :class "entry" :href (format "~a#~a:~a"
+                                                    (file-of entry)
+                                                    (file-of entry)
+                                                    (line-of entry))
+                                       name))
+                      (with-output-to-string (cut display-referer entry))
+                      )))))
+            (else
+             (respond/redirect req #"~(gauche-man-base)~|name|"))))))
+
+(define-http-handler #/^\/find\/.*$/
+  (lambda (req app)
+    (let ((file (string-scan (request-path req) "/find/" 'after)))
+      (respond/redirect req #"/browse/~|file|"))))
+
+;;
+(define-http-handler #/^\/addall\/.*$/
+  (lambda (req app)
+    (let ((dir (string-scan (request-path req) "/addall/" 'after)))
+      (if (string=? dir "")
+        (read-all-gauche-files "./")
+        (read-all-gauche-files dir))
+      ;; redirect to /xref/ ??
+      (respond/redirect req #"/browse/~|dir|"))))
+
+;;
+(define-http-handler #/^\/rebuild/
+  (lambda (req app)
+    (rebuild)
+    (respond/redirect req "/xref/")))
+
+;;
+(define-http-handler #/^\/reset/
+  (lambda (req app)
+    (reset)
+    (respond/redirect req "/browse/")))
+
+;;
+(define-http-handler #/^\/add/
+  (lambda (req app)
+    (let* ((referer (request-header-ref req "referer" "-"))
+           (params  (request-params req))
+           (file    (cadr (assoc "file" params))))
+      (fileset-add file)
+      (respond/redirect req referer))))
+
+;;
+(define-http-handler #/^\/remove/
+  (lambda (req app)
+    (let* ((referer (request-header-ref req "referer" "-"))
+           (params  (request-params req))
+           (file    (cadr (assoc "file" params))))
+      (fileset-remove file)
+      (if (rxmatch #/\/xref\/$/ referer)
+        (rebuild))
+      (respond/redirect req referer))))
+
+;;
+(define-http-handler "/goto"
+  (lambda (req app)
+    (let* ((referer (request-header-ref req "referer" "-"))
+           (params  (request-params req))
+           (file    (cadr (assoc "file" params)))
+           (line    (cadr (assoc "line" params))))
+      (sys-system #"emacsclient -e '(scmxref-goto \"~|file|\" ~|line|)'")
+      (respond/redirect req #"/browse/~|file|#~|file|:~|line|"))))
+
+;;
+(define-http-handler "/close"
+  (lambda (req app)
+    (print "Close request received. Bye Bye.")
+    (exit 0)))
+
+;; We use 'catch all' pattern, so that any req that hasn't match
+;; previous patterns comes here.
+(define-http-handler #/^.*$/
+  (^[req app]
+    (session-create! req app `(#f . ,(request-path req)))
+    (respond/ok req (login-form #f))))
+
+;;;
+;;;  Helper functions
+;;;
+(define lang-precedence-list (make-parameter
+                              '(("jp" jp)
+                                ("ja" jp)
+                                ("en" en))))
+
+(define (set-gauche-man req)
+  (let ((lang (select-response-lang req)))
+    (case lang
+      ((jp) (gauche-man-base "http://practical-scheme.net/gauche/man/?l=jp&p="))
+      (else (gauche-man-base "http://practical-scheme.net/gauche/man/?l=en&p=")))))
+
+(define (select-response-lang req)
+  (let* ((al (request-header-ref req "accept-language" "-"))
+         (lg (find (lambda (x) (string-scan al (car x)))
+                   (lang-precedence-list))))
+    (if lg (cadr lg) 'en)))
+
+(define (make-navigate file)
+  (list "(" (html:a :class "menu" :href #"~(path-to-top file)../"          "MainMenu") ")"
+        "(" (html:a :class "menu" :href #"~(path-to-top file)../browse/"   "TopDir"  ) ")"
+        "(" (html:a :class "menu" :href "./"                               "CurDir")  ")"
+        "(" (html:a :class "menu" :href #"~(path-to-top file)../xref/"     "Index") ")"
+        ))
+
+;;
+(define (handle-gauche req file)
+  (let ((navigate (make-navigate file)))
+    (fileset-add file)
+    (guard (e (else #f))
+      (read-source-file file)
+      (respond/ok req
+        (html:html
+         (html:head (html:style stylesheet)
+                    (html:title file))
+         (html:body navigate
+                    (html:h2 "Gauche File: " file)
+                    (html:pre
+                     (file->list-of-anchored-strings-with-lineno file))
+                    navigate
+          ))))))
+
+;;
+(define (otherfile.jpeg req file)  (respond/ng req 404)) ; for now
+
+(define (otherfile.text req file)
+  (let ((navigate (make-navigate file)))
+    (respond/ok req
+      (html:html
+       (html:head (html:style stylesheet)
+                  (html:title file))
+       (html:body navigate
+                  (html:h2 "Other File: " file)
+                  (html:pre
+                   (with-output-to-string
+                     (lambda ()
+                       (with-input-from-file file
+                         (lambda ()
+                           (copy-port (current-input-port)
+                                      (current-output-port)))))))
+                  navigate
+                  )))))
+
+(define (handle-otherfile req file)
+  (define (is-text? file) #t) ; TODO
+  (define (is-jpeg? file) #f) ; TODO
+  (cond ((is-text? file) (otherfile.text req file))
+        ((is-jpeg? file) (otherfile.jpeg req file))
+        ;; add other content-type
+        (else (respond/ng req 404))))
+
+;;
+(define (respond/directory-list req dir)
+  (respond/ok req
+    (html:html
+     (html:head
+      (html:style stylesheet)
+      (html:title "Listing: " dir))
+     (html:body
+      (list "(" (html:a :class "menu" :href #"~(path-to-top dir)../"               "MainMenu") ")"
+            "(" (html:a :class "menu" :href #"~(path-to-top dir)../browse/"        "TopDir"  ) ")"
+            "(" (html:a :class "menu" :href "./"                                   "Update"  ) ")"
+            "(" (html:a :class "menu" :href #"~(path-to-top dir)../addall/~|dir|"  "AddAll"  ) ")"
+            "(" (html:a :class "menu" :href #"~(path-to-top dir)../rebuild"        "Rebuild" ) ")"
+            "(" (html:a :class "menu" :href #"~(path-to-top dir)../xref/"          "Index"   ) ")"
+            )
+      (html:h2 "Directory listing: " dir)
+      (html:ul
+       (map (lambda (f)
+              (let ((g (simplify-path #"~|dir|/~|f|")))
+                (html:li
+                 (cond ((file-is-directory? g)
+                        (let ((h #"~|f|/"))
+                          (html:a :class "file" :href h h)))
+                       ((file-is-gauche? g)
+                        (if (member g (fileset))
+                          (list
+                           (html:a :class "file" :href f f)
+                           " ("
+                           (html:a :class "remove" :href #"~(path-to-top dir)../remove?file=~|g|" "remove")
+                           ")")
+                          (list
+                           (html:a :class "file" :href f f)
+                           " ("
+                           (html:a :class "remove" :href #"~(path-to-top dir)../add?file=~|g|" "add")
+                           ")")))
+                       (else
+                        (html:a :class "file" :href f f))))))
+            (directory-list dir)))
+      (html:h2 "Help")
+      (html:ol
+       (html:li "Add files to the index by hitting (add).")
+       (html:li "(AddAll) will add all readable files in this directory.")
+       (html:li "Then go (Index) to see cross reference.")
+       (html:li "(Rebuild) rereads all files and rebuild index."))
+      (html:h2 "Warning")
+      (html:p "This program is experimental.  "
+              "No security had taken into account. ")
+      (html:p "Anyone who can connect this server "
+              "can take control of your Emacs. ")))))
+
+;;; We can't use parameter because http-server is multithreaded.
+;;(define fileset (make-parameter '()))
+(define fileset
+  (let ((fs '()))
+    (lambda x
+      (if (null? x)
+        fs
+        (set! fs (car x))))))
+
+(define (fileset-add file)
+  (unless (member file (fileset))
+    (fileset (cons file (fileset)))))
+
+(define (fileset-remove file)
+  (fileset (remove (lambda (x) (string=? x file)) (fileset))))
+
+(define (file->list-of-anchored-strings-with-lineno file)
+  (let* ((L (string-split (file->anchored-string file) #\newline))
+         (N (length L)))
+    (map (lambda (n l)
+           (list "<a class=\"lineno\"href=\"" (path-to-top file)
+                 "../goto?file=" file "&line=" n "\">"
+                 (format "~4,'0d:" n)  "</a> " l "\n"))
+         (iota N 1) L)))
+
+(define (rebuild)
+  (let ((files (fileset)))
+    (build-dictionary files)
+    (for-each (lambda (file)
+                (with-output-to-file (null-device)
+                  (lambda ()
+                    (guard (e ((is-a? e <error>)
+                               (fileset-remove file))
+                              (else (raise e)))
+                      (read-and-anchor-file file)))))
+              files)))
+
+(define (reset)
+  (fileset '())
+  (build-dictionary '()))
+
+(define (read-all-gauche-files dir)
+  (cond ((file-is-directory? dir)
+         (let ((files (filter file-is-gauche?
+                              (map (lambda (x)
+                                     (simplify-path (string-append dir x)))
+                                   (directory-list dir)))))
+           (for-each fileset-add files)
+           (rebuild)))))
+
+(define (file-is-gauche? file)
+  (eq? (guess-file-type file) 'gauche))
+
+(define (guess-file-type file)
+  (if (file-is-directory? file)
+    'directory
+    (if (file-is-regular? file)
+      (cond ((or (let ((e (path-extension file)))
+                   (and e (string=? e "scm")))
+                 (let ((h (guard (e (else #f))
+                            (with-input-from-file file read-line))))
+                   (and h
+                        (string-scan h "#!" )
+                        (string-scan h "gosh"))))
+             'gauche)
+            ;; TODO: add more guess.
+            (else 'unknown))
+      (if (file-exists? file)
+        'what-is-this???
+        'non-existent))))
+
+;;;
+;;;
+;;;
+(define manual-en "\
+<h2>How to use</h2>
+Basically, hit above links one after another.
+<ul>
+  <li> Browse gauche program files using ``Browse files''.
+  <li> If you are asked for passcode, it will likely be 504.
+  <li> Then, hit ``Reference index'' to see index of
+       functions defined in files you have visited so far.
+  <li> To kill <code>scmxref-makiki</code>, hit ``Close server''.
+</ul>
+<p>Theres some convenient Emacs functions in scmxref.el.</p>
+<h2>Warning</h2>
+<p>This program is experimental.
+No security had taken into account.</p>
+<p>Anyone who can connect this server
+can take control of your Emacs.</p>
+")
+
+(define manual-jp "\
+<h2>使い方</h2>
+基本的に上のリンクを一つづつたどって行きます。
+<ul>
+  <li> ``ファイルを見る''のリンクをたどって Gauche のプログラムを眺める。
+  <li> もし Passcode を聞かれたら 504 を入れてみる。
+  <li> ``索引'' に行くを眺めたファイルで定義されいる束縛の一覧が見れます。
+  <li> ``サーバーを止める'' で <code>scmxref-makiki</code> が終了します。
+</ul>
+<p>Emacs から使うための設定が scmxref.el に入っています。
+<h2>注意！</h2>
+<p>
+このプログラムはまだ実験段階なのでセキュリティーのことは全く考慮されてません。
+特に、このサーバーつなげる人ならば誰でもあなたの Emacs をコントール出来てしまうので
+注意しましょう。
+</p>
+")
+
+;;;
+;;; In case gosh binary has ipv6 support but the machine doesn't support it.
+;;;
+(with-module gauche.net
+  (set! ipv6-capable
+        (and (global-variable-bound? 'gauche.net 'sys-getaddrinfo)
+             (guard (e ((is-a? e <system-error>) #f)
+                       (else (raise e)))
+               (let ((s (make-socket AF_INET6 SOCK_STREAM)))
+                 (socket-close s)
+                 #t)))))
+
+(define (mess . x)
+  (for-each (cut display <> (current-error-port)) x)
+  (newline (current-error-port)))
+
+(define (usage progname)
+  (print   "\
+usage: " progname " [options] [file ...]
+options:
+        -h          Print this message.
+        -p port     Port number. Default is 8888.")
+  (exit 0))
+
+(define (main args)
+  (let-args (cdr args)
+      ((port "p|port=i" 8888)
+       (key  "k|key=s"  "504")
+       (help "h|help" => (cut usage (car args)))
+       . rest)
+    (set! *passcode* key)
+    (fileset rest)
+    (rebuild)
+    (print #"Visit http://localhost:~|port|/")
+    (start-http-server :access-log #f :error-log #t :port port
+                       :app-data (atom (make <app>))))
+  0)
+
+;; Local variables:
+;; mode: scheme
+;; end:
