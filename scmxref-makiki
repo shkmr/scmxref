@@ -2,6 +2,7 @@
 ;;
 ;;  scmxref-makiki -- Gacuhe code browser
 ;;
+(use gauche.net)
 (use gauche.parseopt)
 (use gauche.parameter)
 (use gauche.threads)
@@ -541,7 +542,7 @@ can take control of your Emacs.</p>
 usage: " progname " [options] [file ...]
 options:
         -h          Print this message.
-        -p port     Port number. Default is 8888.")
+        -p port     Port number.")
   (exit 0))
 
 (define (main args)
@@ -553,10 +554,18 @@ options:
     (set! *passcode* key)
     (fileset rest)
     (rebuild)
-    (print #"Visit http://localhost:~|port|/")
     (start-http-server :access-log #f :error-log #t :port port
-                       :app-data (atom (make <app>))))
-  0)
+                       :app-data (atom (make <app>))
+                       :startup-callback print-url)
+    0))
+
+(define (print-url server-socks)
+  (let ((port (any (^[s] (sockaddr-port (socket-address s))) server-socks)))
+    #;(let ((ports (map (^[s] (sockaddr-port (socket-address s))) server-socks)))
+      (begin (write server-socks) (newline))
+      (begin (write ports)        (newline)))
+    (print #"Visit http://localhost:~|port|/")
+    (flush)))
 
 ;; Local variables:
 ;; mode: scheme
